@@ -1442,10 +1442,39 @@ async function storeUpdate(mutate) {
   if (spOn()) return spUpdate(mutate);
   if (ghOn()) return ghUpdate(mutate);
   if (ARMAZENAMENTO === 'github') throw new Error('Conecte o GitHub (botão "🔑 Conectar GitHub" no topo da página) antes de gerar.');
-  if (ARMAZENAMENTO === 'sharepoint') throw new Error('Entre com Microsoft (botão no topo da página) antes de gerar.');
+  if (ARMAZENAMENTO === 'sharepoint') return localUpdate(mutate);
   if (!dirReady && dirHandle && await dirHandle.requestPermission({ mode:'readwrite' }) === 'granted') await dirConnect();
   if (dirOn()) return dirUpdate(mutate);
   throw new Error('Escolha a pasta de dados (botão "📁" no topo da página) antes de gerar, para o histórico ficar salvo.');
+}
+
+// Sem SharePoint ainda: grava neste navegador. Ao conectar, spMergeLocal() leva tudo para o SharePoint.
+function localUpdate(mutate) {
+  const data = { proximoNumero: parseInt(numInp.value,10) || 604, historico: tryParse('tks_hist', []) };
+  mutate(data);
+  trySave('tks_hist', data.historico);
+  localStorage.setItem('tks_num', String(data.proximoNumero).padStart(4,'0'));
+  spApply(data);
+  return data;
+}
+async function spMergeLocal() {
+  const local = tryParse('tks_hist', []);
+  const localNum = parseInt(localStorage.getItem('tks_num'),10) || 0;
+  const { data } = await spRead();
+  const keys = new Set(data.historico.map(h => h.tks + '|' + h.ts));
+  const novos = local.filter(h => !keys.has(h.tks + '|' + h.ts));
+  if (novos.length || localNum > data.proximoNumero) {
+    await spUpdate(d => {
+      const ks = new Set(d.historico.map(h => h.tks + '|' + h.ts));
+      d.historico = local.filter(h => !ks.has(h.tks + '|' + h.ts)).concat(d.historico)
+                         .sort((a,b) => String(b.ts).localeCompare(String(a.ts)));
+      d.proximoNumero = Math.max(d.proximoNumero, localNum);
+    });
+  }
+  // Já está no SharePoint: limpa a cópia local para não duplicar depois.
+  trySave('tks_hist', []);
+  localStorage.removeItem('tks_num');
+  return novos.length;
 }
 
 // ──────────── GITHUB (repositório PRIVADO de dados) ────────────
@@ -1712,16 +1741,18 @@ async function spInit() {
     const r = await msal.handleRedirectPromise();
     spAccount = (r && r.account) || msal.getAllAccounts()[0] || null;
   } catch(e) { console.error(e); }
-  if (!spAccount) { spStatus('não conectado', true); return; }
+  if (!spAccount) { spStatus('modo local (sem SharePoint)', true); return; }
   try {
     spStatus('sincronizando…');
+    const n = await spMergeLocal();
     await spRefresh();
     spReady = true;
     spStatus('☁️ SharePoint · ' + spUser());
+    if (n) alert(`${n} extrato(s) gerado(s) em modo local foram enviados para o histórico do SharePoint.`);
   } catch(e) {
     console.error(e);
-    spStatus('erro no SharePoint', true);
-    alert('Erro ao acessar o SharePoint: ' + e.message);
+    spStatus('modo local (SharePoint indisponível)', true);
+    console.warn('SharePoint indisponível, usando modo local: ' + e.message);
   }
 }
 function spLogin() {
