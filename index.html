@@ -596,46 +596,49 @@ function imgDataToCanvas(img) {
   } catch(e) { return null; }
 }
 
+// Retorna [{url, page, top}] — top = borda superior da imagem na página (coordenadas do PDF),
+// usada para saber qual item (título "N. ...") está logo acima de cada foto.
 async function extractEmbeddedImages(pdf) {
   const results = [];
   const MIN = 150; // minimum dimension to keep (skip logos/icons)
+  const OPS = pdfjsLib.OPS, mul = pdfjsLib.Util.transform;
+  const imgTop = m => Math.max(m[5], m[1] + m[5], m[3] + m[5], m[1] + m[3] + m[5]);
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
+    const pageResults = [];
 
-    // ── Step 1: scan operator list for image references ──
+    // ── Step 1: scan operator list for image references (+ posição via matriz de transformação) ──
     const ops = await page.getOperatorList();
-    const xobjNames = [];
-    const inlineImgs = [];
+    const xobjs = [];        // {name, top}
+    const inlineImgs = [];   // {imgData, top}
+    let ctm = [1,0,0,1,0,0];
+    const stack = [];
 
-    // Debug: log all image-related operators found
-    const imgOps = {};
     for (let i = 0; i < ops.fnArray.length; i++) {
-      const fn = ops.fnArray[i];
-      imgOps[fn] = (imgOps[fn]||0)+1;
-      if (fn === pdfjsLib.OPS.paintImageXObject ||
-          fn === pdfjsLib.OPS.paintImageXObjectRepeat) {
-        const name = ops.argsArray[i][0];
-        if (!xobjNames.includes(name)) xobjNames.push(name);
-      } else if (fn === pdfjsLib.OPS.paintInlineImageXObject) {
-        const imgData = ops.argsArray[i][0];
+      const fn = ops.fnArray[i], args = ops.argsArray[i];
+      if (fn === OPS.save) stack.push(ctm);
+      else if (fn === OPS.restore) ctm = stack.pop() || [1,0,0,1,0,0];
+      else if (fn === OPS.transform) ctm = mul(ctm, args);
+      else if (fn === OPS.paintFormXObjectBegin) { stack.push(ctm); if (Array.isArray(args?.[0]) && args[0].length === 6) ctm = mul(ctm, args[0]); }
+      else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || [1,0,0,1,0,0];
+      else if (fn === OPS.paintImageXObject || fn === OPS.paintImageXObjectRepeat) {
+        const name = args[0];
+        if (!xobjs.some(x => x.name === name)) xobjs.push({ name, top: imgTop(ctm) });
+      } else if (fn === OPS.paintInlineImageXObject) {
+        const imgData = args[0];
         if (imgData?.data && imgData.width >= MIN && imgData.height >= MIN)
-          inlineImgs.push(imgData);
+          inlineImgs.push({ imgData, top: imgTop(ctm) });
       }
     }
-    console.log(`[PDF debug] Página ${pageNum}: ops totais=${ops.fnArray.length}`,
-      `paintImageXObject(${pdfjsLib.OPS.paintImageXObject})=${imgOps[pdfjsLib.OPS.paintImageXObject]||0}`,
-      `paintInline(${pdfjsLib.OPS.paintInlineImageXObject})=${imgOps[pdfjsLib.OPS.paintInlineImageXObject]||0}`,
-      `xobjNames=`, xobjNames,
-      `inlineImgs=`, inlineImgs.length);
 
     // ── Step 2: inline images (data already in hand) ──
-    for (const imgData of inlineImgs) {
+    for (const { imgData, top } of inlineImgs) {
       const url = imgDataToCanvas(imgData);
-      if (url) results.push(url);
+      if (url) pageResults.push({ url, page: pageNum, top });
     }
 
-    if (xobjNames.length === 0) continue;
+    if (xobjs.length === 0) { pageResults.sort((a,b) => b.top - a.top); results.push(...pageResults); continue; }
 
     // ── Step 3: render page at low scale to force resource loading ──
     // getOperatorList() starts loading but image messages may still be in-flight.
@@ -647,30 +650,51 @@ async function extractEmbeddedImages(pdf) {
       await page.render({ canvasContext: tmp.getContext('2d'), viewport: vp }).promise;
     } catch(e) { /* still try to read objs even if render failed */ }
 
-    // Debug: what's in page.objs after render?
-    try {
-      const objKeys = Object.keys(page.objs._objs || {});
-      console.log(`[PDF debug] Página ${pageNum}: page.objs keys após render=`, objKeys);
-    } catch(e) {}
-
     // ── Step 4: extract images from page.objs / commonObjs ──
-    for (const name of xobjNames) {
+    for (const { name, top } of xobjs) {
       try {
         const store = name.startsWith('g_') ? page.commonObjs : page.objs;
         const img = await new Promise((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error('timeout')), 5000);
           store.get(name, obj => { clearTimeout(timer); resolve(obj); });
         });
-        if (!img) { console.log(`[PDF debug] ${name}: obj é null/undefined`); continue; }
-        console.log(`[PDF debug] ${name}: hasBitmap=${!!img.bitmap} bmpW=${img.bitmap?.width} bmpH=${img.bitmap?.height} kind=${img.kind} w=${img.width} h=${img.height} dataLen=${img.data?.length}`);
+        if (!img) continue;
         if (img.width < MIN || img.height < MIN) continue;
         if (!img.bitmap && !img.data) continue;
         const url = imgDataToCanvas(img);
-        if (url) results.push(url);
+        if (url) pageResults.push({ url, page: pageNum, top });
       } catch(e) { console.log(`[PDF debug] ${name}: erro=`, e.message); }
     }
+    pageResults.sort((a,b) => b.top - a.top);   // ordem de leitura (de cima para baixo)
+    results.push(...pageResults);
   }
   return results;
+}
+
+// Distribui as fotos pelos itens conforme o PDF de entrada: cada foto vai para o último
+// título de item ("N. DESCRIÇÃO") que aparece acima dela, lendo as páginas de cima para baixo.
+// Retorna o nº do item para cada foto (null = sem item), ou null se não achar nenhum título.
+function assignPhotosByPosition(items, pageLines, imgs) {
+  const nums = new Set(items.map(i => i.num));
+  let started = false, cur = null, any = false;
+  const assign = imgs.map(() => null);
+  for (let p = 1; p <= pageLines.length; p++) {
+    const ev = (pageLines[p-1] || []).map(l => ({ y: l.y, t: l.text }));
+    imgs.forEach((im, i) => { if (im.page === p) ev.push({ y: im.top, img: i }); });
+    ev.sort((a,b) => b.y - a.y);   // estável: em empate, texto vem antes da imagem
+    for (const e of ev) {
+      if (e.img === undefined) {
+        if (/AVARIAS IDENTIFICADAS/i.test(e.t)) { started = true; cur = null; continue; }
+        if (/Atenciosamente/i.test(e.t)) { started = false; cur = null; continue; }
+        const m = e.t.match(/^\s*(\d{1,2})\s*\.\s+\S/);
+        if (started && m && nums.has(+m[1])) cur = +m[1];
+      } else {
+        assign[e.img] = cur;
+        if (cur !== null) any = true;
+      }
+    }
+  }
+  return any ? assign : null;
 }
 
 async function processPDFs(files) {
@@ -685,6 +709,7 @@ async function processPDFs(files) {
 
       // ── Text (all pages, for parsing) ──
       let txt = '';
+      const pageLines = [];   // por página: [{y, text}] — usado para posicionar as fotos
       for (let i=1; i<=pdf.numPages; i++) {
         const page = await pdf.getPage(i);
         const content = await page.getTextContent();
@@ -694,18 +719,27 @@ async function processPDFs(files) {
           (byY[y] = byY[y] || []).push(item.str);
         }
         const ys = Object.keys(byY).map(Number).sort((a,b) => b-a);
-        for (const y of ys) txt += byY[y].join(' ') + '\n';
+        const lines = [];
+        for (const y of ys) { const line = byY[y].join(' '); txt += line + '\n'; lines.push({ y, text: line }); }
+        pageLines.push(lines);
       }
 
       // ── Images: extract embedded images from all pages ──
-      const pageImages = await extractEmbeddedImages(pdf);
+      const imgs = await extractEmbeddedImages(pdf);
+      const pageImages = imgs.map(im => im.url);
 
       const d = parseEmail(txt, f.name);
       d.pageImages = pageImages;
 
-      // Auto-assign: photo i → item i (by order)
-      let pi = 0;
-      d.items.forEach(item => { if (pi < pageImages.length) item.photos = [pageImages[pi++]]; else item.photos = []; });
+      // Fotos → itens conforme a posição no PDF (várias fotos por item).
+      // Se o PDF não tiver os títulos dos itens junto às fotos, volta ao modo antigo (foto i → item i).
+      const assign = assignPhotosByPosition(d.items, pageLines, imgs);
+      if (assign) {
+        d.items.forEach(item => { item.photos = pageImages.filter((u, i) => assign[i] === item.num); });
+      } else {
+        let pi = 0;
+        d.items.forEach(item => { if (pi < pageImages.length) item.photos = [pageImages[pi++]]; else item.photos = []; });
+      }
 
       docs.push(d);
       const fotoMsg = pageImages.length
@@ -1090,15 +1124,7 @@ async function genAllPDF() {
 }
 
 function buildPages(d, tks) {
-  const pages = [buildPg(d,tks)];
-  // Collect all evidence entries (item + photo pairs)
-  const evidList = [];
-  d.items.forEach(item => (item.photos||[]).forEach(photo => evidList.push({item, photo})));
-  // Group in pairs → 2 avarias per page
-  for (let i = 0; i < evidList.length; i += 2) {
-    pages.push(buildEvidPg(d, tks, evidList.slice(i, i + 2)));
-  }
-  return pages;
+  return [...buildSummaryPages(d, tks), ...buildEvidPages(d, tks)];
 }
 function buildPrint(items) {
   const out = document.getElementById('print-out');
@@ -1182,14 +1208,52 @@ function pgFooter() {
   </div>`;
 }
 
-function buildPg(d, tks) {
+// ── Paginação: mede as páginas fora da tela para nada ficar escondido atrás do rodapé ──
+let _measurer = null;
+function measurer() {
+  if (!_measurer) { _measurer = document.createElement('div'); _measurer.className = 'pdf-render'; document.body.appendChild(_measurer); }
+  return _measurer;
+}
+function pgFits(pg) {
+  const c = pg.querySelector('.pg-content');
+  return c.scrollHeight <= c.clientHeight + 1;
+}
+function fitsAlone(pg) {
+  const M = measurer(); M.appendChild(pg);
+  const ok = pgFits(pg);
+  M.removeChild(pg);
+  return ok;
+}
+
+// Página(s) do resumo: se os itens não couberem, continuam na próxima página; total e termos vão no fim.
+function buildSummaryPages(d, tks) {
+  const items = d.items, pages = [];
+  let i = 0;
+  while (true) {
+    const first = pages.length === 0;
+    let pg = buildPg(d, tks, { rows: items.slice(i), first, last: true });
+    if (fitsAlone(pg) || i >= items.length) { pages.push(pg); break; }
+    let k = items.length - i;
+    while (k > 1) {
+      pg = buildPg(d, tks, { rows: items.slice(i, i + k), first, last: false });
+      if (fitsAlone(pg)) break;
+      k--;
+    }
+    if (k === 1) pg = buildPg(d, tks, { rows: items.slice(i, i + 1), first, last: false });
+    pages.push(pg);
+    i += k;
+  }
+  return pages;
+}
+
+function buildPg(d, tks, { rows: rowItems = d.items, first = true, last = true } = {}) {
   const div = document.createElement('div');
   div.className = 'pg';
   div.style.cssText = 'width:210mm;min-height:297mm;position:relative;page-break-after:always;overflow:hidden;font-family:Arial,sans-serif;box-sizing:border-box';
   const today = new Date().toLocaleDateString('pt-BR');
 
   // Opção C: pill de status + número colorido (navy #0d2b6e)
-  const rows = d.items.map(item => {
+  const rows = rowItems.map(item => {
     const isCharged = item.type === 'charged';
     const bg      = isCharged ? '#eef2fa' : '#f9fafb';
     const border  = isCharged ? '1px solid #b3c6e0' : '1px solid #e5e7eb';
@@ -1217,12 +1281,13 @@ function buildPg(d, tks) {
     <img src="${logo2Transparent}" style="position:absolute;bottom:5mm;left:18mm;height:22mm;z-index:5;pointer-events:none">
 
     <!-- Conteúdo: posição absoluta entre os bands — nada vaza pro rodapé -->
-    <div style="position:absolute;top:42mm;left:18mm;right:18mm;bottom:46mm;overflow:hidden;z-index:2;box-sizing:border-box">
+    <div class="pg-content" style="position:absolute;top:42mm;left:18mm;right:18mm;bottom:46mm;overflow:hidden;z-index:2;box-sizing:border-box">
 
       <div style="text-align:center;margin-bottom:4mm">
-        <div style="font-size:22px;font-weight:900;color:#0d2b6e;letter-spacing:1.5px;text-transform:uppercase;line-height:1.25">EXTRATO DE AVARIAS DE DEVOLUÇÃO</div>
-        <div style="font-size:12px;font-weight:700;color:#0d2b6e;margin-top:5px">Nº ${tks}</div>
+        <div style="font-size:${first?22:15}px;font-weight:900;color:#0d2b6e;letter-spacing:1.5px;text-transform:uppercase;line-height:1.25">EXTRATO DE AVARIAS DE DEVOLUÇÃO${first?'':' (CONTINUAÇÃO)'}</div>
+        <div style="font-size:12px;font-weight:700;color:#0d2b6e;margin-top:5px">Nº ${tks}${first?'':` &nbsp;·&nbsp; ${esc(d.placa)}`}</div>
       </div>
+      ${first ? `
 
       <div style="height:1.5px;background:#d4d8e2;margin-bottom:4mm"></div>
 
@@ -1247,39 +1312,109 @@ function buildPg(d, tks) {
           <div style="font-size:7px;color:rgba(255,255,255,0.75);font-weight:700;text-transform:uppercase;margin-bottom:2px;letter-spacing:.5px">${f.l}</div>
           <div style="font-size:8.5px;font-weight:${f.bold?'900':'600'};color:#fff">${esc(f.v)}</div>
         </div>`).join('')}
-      </div>
+      </div>` : ''}
 
-      <div style="margin-bottom:1mm">
+      ${rowItems.length ? `<div style="margin-bottom:1mm">
         <div style="display:flex;align-items:center;gap:10px;padding:4px 10px;border-bottom:1px solid #d4d8e2;margin-bottom:3px">
           <span style="font-size:8px;font-weight:700;color:#9ca3af;min-width:16px">#</span>
           <span style="flex:1;font-size:8px;font-weight:700;color:#9ca3af">DESCRIÇÃO</span>
           <span style="font-size:8px;font-weight:700;color:#9ca3af">VALOR (R$)</span>
         </div>
         ${rows}
-      </div>
+      </div>` : ''}
 
-      <div style="background:#0d2b6e;color:#fff;padding:11px 14px;text-align:right;font-weight:900;font-size:15px;letter-spacing:1px;margin-bottom:5mm;border-radius:8px">
+      ${last ? `<div style="background:#0d2b6e;color:#fff;padding:11px 14px;text-align:right;font-weight:900;font-size:15px;letter-spacing:1px;margin-bottom:5mm;border-radius:8px">
         VALOR TOTAL:&nbsp;&nbsp;${esc(d.totalFmt)}
       </div>
 
       <div style="font-size:10px;font-weight:900;color:#0d2b6e;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">TERMOS E CONDIÇÕES</div>
-      <div style="font-size:7.5px;color:#444;line-height:1.75">${TERMS}</div>
+      <div style="font-size:7.5px;color:#444;line-height:1.75">${TERMS}</div>` : `<div style="text-align:right;font-size:8px;color:#9ca3af;font-style:italic">continua na próxima página…</div>`}
     </div>`;
   return div;
 }
 
-// group = array of {item, photo} — up to 2 per page
-function buildEvidPg(d, tks, group) {
+// Bloco de evidência: cartão do item + TODAS as fotos dele (1 foto grande; 2+ fotos em grade de 2 colunas).
+function evidBlockHtml(item, photos, cont, sep) {
+  const isCharged = item.type === 'charged';
+  const cell = h => p => `<div style="height:${h}mm;display:flex;align-items:center;justify-content:center;border:1px solid #d4d8e2;border-radius:4px;overflow:hidden;background:#fff">
+      <img src="${p}" style="max-width:100%;max-height:100%;display:block"></div>`;
+  const photosHtml = photos.length === 1
+    ? `<div style="width:75%;margin:0 auto">${cell(88)(photos[0])}</div>`
+    : `<div style="display:grid;grid-template-columns:1fr 1fr;gap:3mm">${photos.map(cell(60)).join('')}</div>`;
+  return `<div class="evb">
+      ${sep ? `<div style="height:1px;background:#d4d8e2;margin:0 0 4mm"></div>` : ''}
+      <div style="display:flex;align-items:center;gap:10px;border:1px solid #d4d8e2;border-radius:6px;padding:8px 12px;margin-bottom:3mm;background:#fff">
+        <div style="flex-shrink:0;width:26px;height:26px;background:#0d2b6e;border-radius:50%;color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;line-height:1">${item.num}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:9.5px;font-weight:700;color:#0d2b6e;line-height:1.35">
+            ${esc(item.desc)}${cont?' <span style="font-weight:400;color:#9ca3af">(continuação)</span>':''}${!isCharged&&item.sit?`<em style="font-size:8px;color:#9ca3af;font-weight:400"> (${esc(item.sit)})</em>`:''}
+          </div>
+          <div style="font-size:10.5px;font-weight:700;color:${isCharged?'#0d2b6e':'#9ca3af'};margin-top:2px">R$ ${isCharged?esc(item.valStr||''):'0,00'}</div>
+        </div>
+        ${!isCharged?`<div style="flex-shrink:0;background:#fee2e2;border:1px solid #fca5a5;border-radius:4px;padding:4px 7px;font-size:7px;font-weight:700;color:#b91c1c;text-align:center;line-height:1.5;white-space:nowrap">NÃO COBRADO${item.sit?'<br>'+esc(item.sit):''}</div>`:''}
+      </div>
+      <div style="margin-bottom:4mm">${photosHtml}</div>
+    </div>`;
+}
+function htmlEl(html) { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstChild; }
+
+// Páginas de evidências: itens em ordem, cada um com suas fotos juntas. Um item só é dividido
+// entre páginas se não couber inteiro nem numa página vazia.
+function buildEvidPages(d, tks) {
+  const M = measurer(), pages = [];
+  let cur = null;
+  const newPage = () => { cur = buildEvidPg(d, tks); M.appendChild(cur); pages.push(cur); };
+  const list = () => cur.querySelector('.evid-list');
+  const tryAdd = (item, photos, cont) => {
+    const el = htmlEl(evidBlockHtml(item, photos, cont, list().children.length > 0));
+    list().appendChild(el);
+    if (pgFits(cur)) return true;
+    el.remove();
+    return false;
+  };
+  for (const item of d.items) {
+    let rest = (item.photos || []).slice(), cont = false;
+    while (rest.length) {
+      if (!cur) newPage();
+      if (tryAdd(item, rest, cont)) break;                       // cabe inteiro aqui
+      if (list().children.length) { newPage(); continue; }        // tenta inteiro numa página nova
+      // nem numa página vazia: divide as fotos
+      let k = rest.length - 1;
+      while (k > 1 && !tryAdd(item, rest.slice(0, k), cont)) k--;
+      if (k <= 1) list().appendChild(htmlEl(evidBlockHtml(item, rest.slice(0, 1), cont, false)));
+      rest = rest.slice(Math.max(k, 1)); cont = true;
+      if (rest.length) newPage();
+    }
+  }
+  pages.forEach(p => p.remove());
+  return pages;
+}
+
+function buildEvidPg(d, tks) {
+  const div = document.createElement('div');
+  div.className = 'pg';
+  div.style.cssText = 'width:210mm;min-height:297mm;position:relative;page-break-after:always;overflow:hidden;font-family:Arial,sans-serif;box-sizing:border-box';
+  div.innerHTML = `
+    <img src="${timbSrc}" style="position:absolute;top:0;left:0;width:200%;height:100%;display:block;z-index:0;pointer-events:none">
+    <img src="${logo2Transparent}" style="position:absolute;bottom:5mm;left:18mm;height:22mm;z-index:5;pointer-events:none">
+
+    <!-- Conteúdo evidências: posição absoluta entre os bands -->
+    <div class="pg-content" style="position:absolute;top:36mm;left:18mm;right:18mm;bottom:46mm;overflow:hidden;z-index:2;box-sizing:border-box">
+      <div style="font-size:15px;font-weight:900;color:#0d2b6e;letter-spacing:1px;text-transform:uppercase;margin-bottom:2px">EVIDÊNCIAS, DESCRIÇÕES E AVARIAS</div>
+      <div style="font-size:10px;font-weight:700;color:#0d2b6e;margin-bottom:4mm">Nº ${tks} &nbsp;·&nbsp; ${esc(d.placa)} &nbsp;·&nbsp; ${esc(d.locatario)}</div>
+      <div style="height:1.5px;background:#d4d8e2;margin-bottom:4mm"></div>
+      <div class="evid-list"></div>
+    </div>`;
+  return div;
+}
+
+// (layout antigo, não usado) group = array of {item, photo}
+function buildEvidPgOld(d, tks, group) {
   const div = document.createElement('div');
   div.className = 'pg';
   div.style.cssText = 'width:210mm;min-height:297mm;position:relative;page-break-after:always;overflow:hidden;font-family:Arial,sans-serif;box-sizing:border-box';
 
-  // Content area: 297 - 42(top) - 46(bottom) = 209mm
-  // Header block: ~20mm, separator: ~2mm, each card: ~12mm + margin 3mm
-  // Remaining for photos: 209 - 20 - 2 - group.length*(12+3)
-  const photoMaxMm = group.length === 1
-    ? 140  // single item: cap at 140mm
-    : 62;  // two items: (209-20-2-30)/2 ≈ 78, conservative 62mm
+  const photoMaxMm = group.length === 1 ? 140 : 62;
 
   const blocksHtml = group.map(({item, photo}, gi) => {
     const isCharged = item.type === 'charged';
