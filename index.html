@@ -170,8 +170,10 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 <header class="topbar">
   <img id="topbar-img" style="height:48px;display:block">
   <div class="topbar-name">Gerador de Extratos de Avarias</div>
+  <button class="topbar-badge" id="dir-btn" style="display:none;border:0;cursor:pointer" onclick="dirClick()">📁 Escolher pasta de dados</button>
   <div class="topbar-badge" id="sync-badge">conectando…</div>
   <button class="topbar-badge" id="sync-login" style="display:none;border:0;cursor:pointer;background:#fff;color:var(--navy);font-weight:600" onclick="spLogin()">Entrar com Microsoft</button>
+  <button class="topbar-badge" id="gh-btn" style="display:none;border:0;cursor:pointer;background:#fff;color:var(--navy);font-weight:600" onclick="ghConnect()">🔑 Conectar GitHub</button>
 </header>
 
 <main class="main">
@@ -465,7 +467,11 @@ let logo2Transparent = logo2Src;
 
 // Load history display on tab switch
 renderHist();
-window.addEventListener('load', () => spInit());
+window.addEventListener('load', () => {
+  if (ARMAZENAMENTO === 'github') ghInit();
+  else if (ARMAZENAMENTO === 'sharepoint') spInit();
+  else { document.getElementById('dir-btn').style.display = ''; document.getElementById('sync-badge').style.display = 'none'; dirInit(); }
+});
 
 // ──────────── TABS ────────────
 function goTab(name) {
@@ -473,7 +479,12 @@ function goTab(name) {
   document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', names[i]===name));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
-  if (name==='history') { renderHist(); if (spOn()) spRefresh().catch(console.error); }
+  if (name==='history') {
+    renderHist();
+    if (spOn()) spRefresh().catch(console.error);
+    else if (ghOn()) ghRead().then(r => spApply(r.data)).catch(console.error);
+    else if (dirOn()) dirRead().then(spApply).catch(console.error);
+  }
 }
 
 // ──────────── NUMBER ────────────
@@ -481,28 +492,18 @@ async function saveNum() {
   updateNumPreview();
   const n = parseInt(numInp.value,10);
   if (!n) return;
-  if (!spOn()) { localStorage.setItem('tks_num', numInp.value); return; }
+  if (!spOn() && !ghOn() && !dirOn()) { localStorage.setItem('tks_num', numInp.value); return; }
   try {
-    await spUpdate(data => { data.proximoNumero = n; });
-  } catch(e) { alert('Não foi possível salvar o número no SharePoint: '+e.message); }
+    await storeUpdate(data => { data.proximoNumero = n; });
+  } catch(e) { alert('Não foi possível salvar o número: '+e.message); }
 }
 function updateNumPreview() { document.getElementById('num-preview').textContent = numInp.value.padStart(4,'0'); }
 function fmtTKS(n) { return `TKS-${String(n).padStart(4,'0')}-${new Date().getFullYear()}`; }
 
 // Reserva números TKS de forma atômica e grava o histórico. Retorna os números na ordem de ds.
 async function reserveTKS(ds) {
-  if (!spOn()) {
-    if (spCfgOk()) throw new Error('Você não está conectado ao SharePoint. Clique em "Entrar com Microsoft" no topo da página.');
-    const start = parseInt(numInp.value,10)||604;
-    const tksList = ds.map((d,i)=>fmtTKS(start+i));
-    ds.forEach((d,i)=>hist.unshift(histEntry(d,tksList[i])));
-    trySave('tks_hist', hist);
-    numInp.value = String(start+ds.length).padStart(4,'0');
-    localStorage.setItem('tks_num', numInp.value); updateNumPreview();
-    return tksList;
-  }
   let tksList;
-  await spUpdate(data => {
+  await storeUpdate(data => {
     const start = data.proximoNumero;
     tksList = ds.map((d,i)=>fmtTKS(start+i));
     ds.forEach((d,i)=>data.historico.unshift(histEntry(d,tksList[i])));
@@ -1129,19 +1130,32 @@ async function buildPdfBlob(d, tks) {
 
 // Envia os PDFs para a pasta do SharePoint e grava o link no histórico.
 async function archivePDFs(items) {
-  if (!spOn()) return;
+  const sp = spOn(), gh = ghOn();
+  if (!sp && !gh && !dirOn()) return;
+  const status = (sp || gh) ? spStatus : dirBtn;
   const falhas = [];
   for (let i = 0; i < items.length; i++) {
     const { d, tks } = items[i];
-    spStatus(`☁️ arquivando PDF ${i+1}/${items.length}…`);
+    status(`${sp?'☁️':'📁'} arquivando PDF ${i+1}/${items.length}…`);
     try {
       const blob = await buildPdfBlob(d, tks);
-      const url = await spUploadPdf(blob, `EXTRATO ${tks} - ${d.placa||'SEM PLACA'}.pdf`);
-      await spUpdate(data => { const h = data.historico.find(x => x.tks === tks); if (h) h.pdfUrl = url; });
+      const name = `EXTRATO ${tks} - ${d.placa||'SEM PLACA'}.pdf`;
+      if (sp) {
+        const url = await spUploadPdf(blob, name);
+        await spUpdate(data => { const h = data.historico.find(x => x.tks === tks); if (h) h.pdfUrl = url; });
+      } else if (gh) {
+        const path = await ghSavePdf(blob, name);
+        await ghUpdate(data => { const h = data.historico.find(x => x.tks === tks); if (h) h.pdfGh = path; });
+      } else {
+        const arq = await dirSavePdf(blob, name);
+        await dirUpdate(data => { const h = data.historico.find(x => x.tks === tks); if (h) h.pdfArq = arq; });
+      }
     } catch(e) { console.error(e); falhas.push(tks + ' (' + e.message + ')'); }
   }
-  spStatus('☁️ SharePoint · ' + spUser());
-  if (falhas.length) alert('Não foi possível arquivar no SharePoint:\n' + falhas.join('\n'));
+  if (sp) spStatus('☁️ SharePoint · ' + spUser());
+  else if (gh) spStatus('🗄️ GitHub · ' + ghUser);
+  else dirBtn('📁 dados: ' + dirHandle.name);
+  if (falhas.length) alert('Não foi possível arquivar o PDF:\n' + falhas.join('\n'));
 }
 
 function pgCorner() {
@@ -1391,27 +1405,275 @@ ${wp(wr(TERMS,{sz:'16'}))}
 // ──────────── HISTORY ────────────
 function histEntry(d,tks) {
   return { tks, placa:d.placa, cliente:d.locatario, data:new Date().toLocaleDateString('pt-BR'),
-           total:d.totalFmt, ts:new Date().toISOString(), usuario:spUser() };
+           total:d.totalFmt, ts:new Date().toISOString(), usuario:spUser() || ghUser || dirUser() };
+}
+function pdfLink(h) {
+  if (h.pdfUrl) return `<a href="${esc(h.pdfUrl)}" target="_blank" rel="noopener">📄 abrir</a>`;
+  if (h.pdfGh) return `<a href="#" data-gh="${esc(h.pdfGh)}" onclick="ghOpenPdf(this.dataset.gh);return false">📄 abrir</a>`;
+  if (h.pdfArq) return `<a href="#" data-arq="${esc(h.pdfArq)}" onclick="openArq(this.dataset.arq);return false">📄 abrir</a>`;
+  return '';
 }
 function renderHist() {
   const tb = document.getElementById('hist-body');
   tb.innerHTML = hist.length
-    ? hist.map(h=>`<tr><td><b>${esc(h.tks)}</b></td><td>${esc(h.placa)}</td><td>${esc(h.cliente)}</td><td>${esc(h.data)}</td><td><b>${esc(h.total)}</b></td><td style="color:var(--muted);font-size:11px">${new Date(h.ts).toLocaleString('pt-BR')}</td><td style="font-size:11px">${esc(h.usuario)}</td><td>${h.pdfUrl?`<a href="${esc(h.pdfUrl)}" target="_blank" rel="noopener">📄 abrir</a>`:''}</td></tr>`).join('')
+    ? hist.map(h=>`<tr><td><b>${esc(h.tks)}</b></td><td>${esc(h.placa)}</td><td>${esc(h.cliente)}</td><td>${esc(h.data)}</td><td><b>${esc(h.total)}</b></td><td style="color:var(--muted);font-size:11px">${new Date(h.ts).toLocaleString('pt-BR')}</td><td style="font-size:11px">${esc(h.usuario)}</td><td>${pdfLink(h)}</td></tr>`).join('')
     : '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px">Nenhum extrato gerado ainda.</td></tr>';
 }
 function dlHistCSV() {
   const hdr='Nº TKS\tPlaca\tCliente\tData\tTotal\tGerado em\tUsuário\tPDF\n';
-  const rows=hist.map(h=>`${h.tks}\t${h.placa}\t${h.cliente}\t${h.data}\t${h.total}\t${new Date(h.ts).toLocaleString('pt-BR')}\t${h.usuario||''}\t${h.pdfUrl||''}`).join('\n');
+  const rows=hist.map(h=>`${h.tks}\t${h.placa}\t${h.cliente}\t${h.data}\t${h.total}\t${new Date(h.ts).toLocaleString('pt-BR')}\t${h.usuario||''}\t${h.pdfUrl||h.pdfGh||h.pdfArq||''}`).join('\n');
   dlBlob(new Blob(['﻿'+hdr+rows],{type:'text/csv;charset=utf-8'}),'historico_extratos.csv');
 }
 async function clearHist() {
-  if (!spOn()) {
+  if (!spOn() && !ghOn() && !dirOn()) {
     if (!confirm('Limpar todo o histórico?')) return;
     hist=[]; trySave('tks_hist',[]); renderHist(); return;
   }
   if (!confirm('O histórico é compartilhado: isso apaga o histórico de TODOS os usuários. Continuar?')) return;
-  try { await spUpdate(data => { data.historico = []; }); }
-  catch(e) { alert('Não foi possível limpar no SharePoint: '+e.message); }
+  try { await storeUpdate(data => { data.historico = []; }); }
+  catch(e) { alert('Não foi possível limpar o histórico: '+e.message); }
+}
+
+// Onde ficam número TKS, histórico e PDFs: 'github' | 'sharepoint' | 'pasta'
+const ARMAZENAMENTO = 'sharepoint';
+
+// Grava no armazenamento ativo.
+async function storeUpdate(mutate) {
+  if (spOn()) return spUpdate(mutate);
+  if (ghOn()) return ghUpdate(mutate);
+  if (ARMAZENAMENTO === 'github') throw new Error('Conecte o GitHub (botão "🔑 Conectar GitHub" no topo da página) antes de gerar.');
+  if (ARMAZENAMENTO === 'sharepoint') throw new Error('Entre com Microsoft (botão no topo da página) antes de gerar.');
+  if (!dirReady && dirHandle && await dirHandle.requestPermission({ mode:'readwrite' }) === 'granted') await dirConnect();
+  if (dirOn()) return dirUpdate(mutate);
+  throw new Error('Escolha a pasta de dados (botão "📁" no topo da página) antes de gerar, para o histórico ficar salvo.');
+}
+
+// ──────────── GITHUB (repositório PRIVADO de dados) ────────────
+// O site fica no repo público; número TKS, histórico e PDFs ficam no repo privado abaixo.
+// Cada usuário cola o próprio token (fine-grained, Contents: Read and write) uma vez.
+const GH_CONFIG = {
+  owner:     'MaroniTechDevelopers',
+  repo:      'extratostks-dados',
+  branch:    'main',
+  file:      'tks_dados.json',
+  pdfFolder: 'PDFs'                 // PDFs/<ano>/EXTRATO ....pdf
+};
+let ghToken = localStorage.getItem('tks_gh_token') || '', ghUser = '', ghReady = false;
+
+function ghOn() { return ghReady; }
+function ghShowBtn(show, txt='🔑 Conectar GitHub') {
+  const b = document.getElementById('gh-btn');
+  b.textContent = txt; b.style.display = show ? '' : 'none';
+}
+function ghPath(p) { return p.split('/').map(encodeURIComponent).join('/'); }
+async function ghApi(url, opts={}) {
+  const headers = Object.assign({ Authorization: 'Bearer ' + ghToken, Accept: 'application/vnd.github+json',
+                                  'X-GitHub-Api-Version': '2022-11-28' }, opts.headers || {});
+  const r = await fetch('https://api.github.com' + url, Object.assign({}, opts, { headers, cache: 'no-store' }));
+  if (r.status === 401) {
+    ghReady = false; ghToken = ''; localStorage.removeItem('tks_gh_token');
+    spStatus('token do GitHub inválido ou vencido'); ghShowBtn(true);
+    throw new Error('token do GitHub inválido ou vencido. Clique em "🔑 Conectar GitHub" e cole um novo.');
+  }
+  return r;
+}
+function b64ToBytes(b64) { return Uint8Array.from(atob(b64.replace(/\s/g,'')), c => c.charCodeAt(0)); }
+function bytesToB64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+const contentsUrl = p => `/repos/${GH_CONFIG.owner}/${GH_CONFIG.repo}/contents/${ghPath(p)}`;
+
+async function ghInit() {
+  if (!ghToken) { spStatus('GitHub não conectado'); ghShowBtn(true); return; }
+  try {
+    spStatus('sincronizando…');
+    const u = await ghApi('/user');
+    if (u.ok) { const j = await u.json(); ghUser = j.name || j.login; }
+    spApply((await ghRead()).data);
+    ghReady = true;
+    spStatus('🗄️ GitHub · ' + ghUser); ghShowBtn(false);
+  } catch(e) {
+    console.error(e);
+    spStatus('erro no GitHub'); ghShowBtn(true, '🔑 Trocar token');
+    alert('Erro ao acessar os dados no GitHub: ' + e.message);
+  }
+}
+function ghConnect() {
+  const t = (prompt('Cole seu token do GitHub (começa com github_pat_ ou ghp_).\nEle fica salvo só neste navegador.') || '').trim();
+  if (!t) return;
+  ghToken = t; localStorage.setItem('tks_gh_token', t);
+  ghInit();
+}
+// Lê o JSON + sha (versão). Cria o arquivo se ainda não existir.
+async function ghRead() {
+  const r = await ghApi(contentsUrl(GH_CONFIG.file) + `?ref=${GH_CONFIG.branch}`);
+  if (r.status === 404) {
+    const repo = await ghApi(`/repos/${GH_CONFIG.owner}/${GH_CONFIG.repo}`);
+    if (!repo.ok) throw new Error(`repositório ${GH_CONFIG.owner}/${GH_CONFIG.repo} não encontrado ou sem acesso (${repo.status})`);
+    // 1º uso: leva o que já existe neste navegador
+    const init = { proximoNumero: parseInt(numInp.value,10) || 604, historico: hist.slice() };
+    await ghWrite(init, null, 'Cria arquivo de dados');
+    return ghRead();
+  }
+  if (!r.ok) throw new Error(`erro ao ler dados (${r.status})`);
+  const m = await r.json();
+  let b64 = m.content;
+  if (!b64) {                                   // arquivos > 1 MB vêm vazios: busca pelo blob
+    const b = await ghApi(`/repos/${GH_CONFIG.owner}/${GH_CONFIG.repo}/git/blobs/${m.sha}`);
+    if (!b.ok) throw new Error(`erro ao ler dados (${b.status})`);
+    b64 = (await b.json()).content;
+  }
+  let data;
+  try { data = JSON.parse(new TextDecoder().decode(b64ToBytes(b64))); }
+  catch(e) { throw new Error('o arquivo de dados está corrompido; restaure uma versão anterior pelo histórico do GitHub'); }
+  return { data: normData(data), sha: m.sha };
+}
+async function ghWrite(data, sha, message) {
+  const body = { message, branch: GH_CONFIG.branch,
+                 content: bytesToB64(new TextEncoder().encode(JSON.stringify(data, null, 2))) };
+  if (sha) body.sha = sha;
+  return ghApi(contentsUrl(GH_CONFIG.file), { method:'PUT', body: JSON.stringify(body) });
+}
+// Leitura → alteração → gravação com o sha. Se outro usuário gravou no meio, tenta de novo.
+async function ghUpdate(mutate, message='Atualiza dados') {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const { data, sha } = await ghRead();
+    mutate(data);
+    const r = await ghWrite(data, sha, `${message} (${ghUser || 'usuário'})`);
+    if (r.ok) { spApply(data); return data; }
+    if (r.status !== 409 && r.status !== 422) throw new Error(`erro ao gravar (${r.status})`);
+    await new Promise(res => setTimeout(res, 400 + Math.random()*800));
+  }
+  throw new Error('dados ocupados por outro usuário, tente novamente');
+}
+async function ghSavePdf(blob, name) {
+  const safe = name.replace(/[\\/:*?"<>|#%]/g, '-');
+  const path = `${GH_CONFIG.pdfFolder}/${new Date().getFullYear()}/${safe}`;
+  const content = bytesToB64(new Uint8Array(await blob.arrayBuffer()));
+  const put = sha => ghApi(contentsUrl(path), { method:'PUT',
+    body: JSON.stringify(Object.assign({ message: `PDF ${safe}`, branch: GH_CONFIG.branch, content }, sha ? { sha } : {})) });
+  let r = await put(null);
+  if (r.status === 422) {                       // já existe: substitui
+    const ex = await ghApi(contentsUrl(path) + `?ref=${GH_CONFIG.branch}`);
+    if (ex.ok) r = await put((await ex.json()).sha);
+  }
+  if (!r.ok) throw new Error(`erro ao enviar PDF (${r.status})`);
+  return path;
+}
+async function ghOpenPdf(path) {
+  if (!ghOn()) { alert('Conecte o GitHub (botão no topo) para abrir o PDF.'); return; }
+  const win = window.open('', '_blank');
+  try {
+    const r = await ghApi(contentsUrl(path) + `?ref=${GH_CONFIG.branch}`, { headers: { Accept: 'application/vnd.github.raw' } });
+    if (!r.ok) throw new Error(r.status);
+    const url = URL.createObjectURL(new Blob([await r.arrayBuffer()], { type: 'application/pdf' }));
+    if (win) win.location = url; else window.open(url, '_blank');
+  } catch(e) { if (win) win.close(); alert('PDF não encontrado no GitHub: ' + path); }
+}
+
+// ──────────── PASTA DE DADOS (JSON local / OneDrive) ────────────
+// Enquanto o SharePoint não está liberado, número TKS, histórico e PDFs ficam numa
+// pasta escolhida pelo usuário (ex.: "dados" sincronizada pelo OneDrive).
+// Estrutura: tks_dados.json · backup/tks_dados_AAAA-MM-DD.json · PDFs/<ano>/*.pdf
+const DIR_FILE = 'tks_dados.json';
+let dirHandle = null, dirReady = false;
+
+function dirOn() { return dirReady; }
+function dirUser() {
+  let u = localStorage.getItem('tks_usuario');
+  if (!u) {
+    u = (prompt('Digite seu nome (vai aparecer no histórico):') || '').trim();
+    if (u) localStorage.setItem('tks_usuario', u);
+  }
+  return u || '';
+}
+function dirBtn(txt) { document.getElementById('dir-btn').textContent = txt; }
+
+async function dirInit() {
+  if (!window.showDirectoryPicker) { dirBtn('📁 use Chrome ou Edge para salvar em pasta'); return; }
+  try { dirHandle = await loadFromIDB('dirHandle'); } catch(e) { dirHandle = null; }
+  if (!dirHandle) { dirBtn('📁 Escolher pasta de dados'); return; }
+  try {
+    if (await dirHandle.queryPermission({ mode:'readwrite' }) === 'granted') { await dirConnect(); return; }
+  } catch(e) { console.error(e); }
+  dirBtn(`📁 Reconectar pasta "${dirHandle.name}"`);
+}
+async function dirClick() {
+  try {
+    if (dirHandle && !dirReady) {
+      if (await dirHandle.requestPermission({ mode:'readwrite' }) === 'granted') { await dirConnect(); return; }
+    }
+    const h = await window.showDirectoryPicker({ id:'tks-dados', mode:'readwrite' });
+    dirHandle = h;
+    await saveToIDB('dirHandle', h);
+    await dirConnect();
+  } catch(e) {
+    if (e.name !== 'AbortError') alert('Erro na pasta de dados: ' + e.message);
+  }
+}
+async function dirConnect() {
+  const data = await dirRead();
+  dirReady = true;
+  if (!spOn()) spApply(data);
+  dirBtn('📁 dados: ' + dirHandle.name);
+}
+function normData(d) {
+  d.proximoNumero = parseInt(d.proximoNumero,10) || 604;
+  d.historico = Array.isArray(d.historico) ? d.historico : [];
+  return d;
+}
+// Lê o JSON da pasta. Se não existir, cria com o que já estava neste navegador.
+async function dirRead() {
+  let fh;
+  try { fh = await dirHandle.getFileHandle(DIR_FILE); }
+  catch(e) {
+    if (e.name !== 'NotFoundError') throw e;
+    const init = { proximoNumero: parseInt(numInp.value,10) || 604, historico: hist.slice() };
+    await dirWrite(init);
+    return init;
+  }
+  const txt = await (await fh.getFile()).text();
+  // Se o JSON estiver corrompido, não sobrescreve (para não perder o histórico).
+  try { return normData(txt.trim() ? JSON.parse(txt) : {}); }
+  catch(e) { throw new Error(`o arquivo ${DIR_FILE} está corrompido; restaure um da pasta backup`); }
+}
+async function writeFile(dir, name, content) {
+  const fh = await dir.getFileHandle(name, { create:true });
+  const w = await fh.createWritable();
+  await w.write(content);
+  await w.close();
+}
+async function dirWrite(data) {
+  const txt = JSON.stringify(data, null, 2);
+  await writeFile(dirHandle, DIR_FILE, txt);
+  const bk = await dirHandle.getDirectoryHandle('backup', { create:true });
+  await writeFile(bk, `tks_dados_${new Date().toISOString().slice(0,10)}.json`, txt);
+}
+async function dirUpdate(mutate) {
+  const data = await dirRead();
+  mutate(data);
+  await dirWrite(data);
+  spApply(data);
+  return data;
+}
+async function dirSavePdf(blob, name) {
+  const safe = name.replace(/[\\/:*?"<>|#%]/g, '-');
+  const ano = String(new Date().getFullYear());
+  const pdfs = await dirHandle.getDirectoryHandle('PDFs', { create:true });
+  await writeFile(await pdfs.getDirectoryHandle(ano, { create:true }), safe, blob);
+  return `PDFs/${ano}/${safe}`;
+}
+async function openArq(path) {
+  if (!dirReady) { alert('Conecte a pasta de dados (botão "📁" no topo) para abrir o PDF.'); return; }
+  try {
+    const parts = path.split('/');
+    let dir = dirHandle;
+    for (const p of parts.slice(0,-1)) dir = await dir.getDirectoryHandle(p);
+    const file = await (await dir.getFileHandle(parts[parts.length-1])).getFile();
+    window.open(URL.createObjectURL(file), '_blank');
+  } catch(e) { alert('PDF não encontrado na pasta de dados: ' + path); }
 }
 
 // ──────────── SHAREPOINT (JSON compartilhado via Microsoft Graph) ────────────
@@ -1505,8 +1767,8 @@ async function spRead() {
   if (!spFolder) await spResolveFolder();
   const meta = await gfetch(spFileUrl());
   if (meta.status === 404) {
-    const init = { proximoNumero: parseInt(localStorage.getItem('tks_num'),10) || 604,
-                   historico: tryParse('tks_hist', []) };
+    // 1º acesso ao SharePoint: leva o que já existe (pasta de dados ou navegador)
+    const init = { proximoNumero: parseInt(numInp.value,10) || 604, historico: hist.slice() };
     const c = await gfetch(spFileUrl(':/content?@microsoft.graph.conflictBehavior=fail'),
       { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(init, null, 2) });
     if (!c.ok && c.status !== 409) throw new Error(`não foi possível criar o arquivo (${c.status})`);
