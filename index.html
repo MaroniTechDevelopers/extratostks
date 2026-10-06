@@ -7,6 +7,9 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.28.1/lib/msal-browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
 /* ═══ TOKENS ═══ */
 :root {
@@ -129,6 +132,11 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 
 @page { size:A4; margin:0 }
 
+/* Render fora da tela para gerar o PDF arquivado no SharePoint */
+.pdf-render { position:fixed; left:-10000px; top:0; width:210mm; background:#fff }
+.pdf-render .pg { width:210mm; min-height:297mm; position:relative; overflow:hidden; background:#fff; font-family:Arial,sans-serif }
+@media print { .pdf-render { display:none } }
+
 /* Output components (shared screen+print) */
 .pg {
   font-family:'Inter',Arial,sans-serif;
@@ -162,7 +170,8 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 <header class="topbar">
   <img id="topbar-img" style="height:48px;display:block">
   <div class="topbar-name">Gerador de Extratos de Avarias</div>
-  <div class="topbar-badge">offline · v1.0</div>
+  <div class="topbar-badge" id="sync-badge">conectando…</div>
+  <button class="topbar-badge" id="sync-login" style="display:none;border:0;cursor:pointer;background:#fff;color:var(--navy);font-weight:600" onclick="spLogin()">Entrar com Microsoft</button>
 </header>
 
 <main class="main">
@@ -180,7 +189,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
       <div class="card-title">⚙️ Configurações</div>
       <div class="srow">
         <label>Próximo Nº TKS</label>
-        <input class="num-inp" id="next-num" value="0604" maxlength="6" oninput="saveNum()">
+        <input class="num-inp" id="next-num" value="0604" maxlength="6" oninput="updateNumPreview()" onchange="saveNum()">
         <span style="font-size:11px;color:var(--muted)">→ TKS-<span id="num-preview">0604</span>-<span id="yr-preview"></span></span>
       </div>
     </div>
@@ -224,7 +233,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
       <div class="card-title">📜 Histórico</div>
       <div style="overflow-x:auto">
         <table class="htbl">
-          <thead><tr><th>Nº TKS</th><th>Placa</th><th>Cliente</th><th>Data</th><th>Total</th><th>Gerado em</th></tr></thead>
+          <thead><tr><th>Nº TKS</th><th>Placa</th><th>Cliente</th><th>Data</th><th>Total</th><th>Gerado em</th><th>Usuário</th><th>PDF</th></tr></thead>
           <tbody id="hist-body"></tbody>
         </table>
       </div>
@@ -456,6 +465,7 @@ let logo2Transparent = logo2Src;
 
 // Load history display on tab switch
 renderHist();
+window.addEventListener('load', () => spInit());
 
 // ──────────── TABS ────────────
 function goTab(name) {
@@ -463,18 +473,42 @@ function goTab(name) {
   document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', names[i]===name));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
-  if (name==='history') renderHist();
+  if (name==='history') { renderHist(); if (spOn()) spRefresh().catch(console.error); }
 }
 
 // ──────────── NUMBER ────────────
-function saveNum() { localStorage.setItem('tks_num', numInp.value); updateNumPreview(); }
-function updateNumPreview() { document.getElementById('num-preview').textContent = numInp.value.padStart(4,'0'); }
-function getTKS(offset=0) {
-  return `TKS-${String((parseInt(numInp.value,10)||604)+offset).padStart(4,'0')}-${new Date().getFullYear()}`;
+async function saveNum() {
+  updateNumPreview();
+  const n = parseInt(numInp.value,10);
+  if (!n) return;
+  if (!spOn()) { localStorage.setItem('tks_num', numInp.value); return; }
+  try {
+    await spUpdate(data => { data.proximoNumero = n; });
+  } catch(e) { alert('Não foi possível salvar o número no SharePoint: '+e.message); }
 }
-function incNum(n=1) {
-  numInp.value = String((parseInt(numInp.value,10)||604)+n).padStart(4,'0');
-  saveNum();
+function updateNumPreview() { document.getElementById('num-preview').textContent = numInp.value.padStart(4,'0'); }
+function fmtTKS(n) { return `TKS-${String(n).padStart(4,'0')}-${new Date().getFullYear()}`; }
+
+// Reserva números TKS de forma atômica e grava o histórico. Retorna os números na ordem de ds.
+async function reserveTKS(ds) {
+  if (!spOn()) {
+    if (spCfgOk()) throw new Error('Você não está conectado ao SharePoint. Clique em "Entrar com Microsoft" no topo da página.');
+    const start = parseInt(numInp.value,10)||604;
+    const tksList = ds.map((d,i)=>fmtTKS(start+i));
+    ds.forEach((d,i)=>hist.unshift(histEntry(d,tksList[i])));
+    trySave('tks_hist', hist);
+    numInp.value = String(start+ds.length).padStart(4,'0');
+    localStorage.setItem('tks_num', numInp.value); updateNumPreview();
+    return tksList;
+  }
+  let tksList;
+  await spUpdate(data => {
+    const start = data.proximoNumero;
+    tksList = ds.map((d,i)=>fmtTKS(start+i));
+    ds.forEach((d,i)=>data.historico.unshift(histEntry(d,tksList[i])));
+    data.proximoNumero = start + ds.length;
+  });
+  return tksList;
 }
 
 // ──────────── IDB ────────────
@@ -1039,33 +1073,75 @@ function dlTSV() {
 }
 
 // ──────────── PDF GENERATION ────────────
-function genOnePDF(ci) {
-  const d = docs[ci]; const tks = getTKS(ci);
+async function genOnePDF(ci) {
+  const d = docs[ci];
+  let tks;
+  try { [tks] = await reserveTKS([d]); } catch(e) { alert(e.message); return; }
   buildPrint([{d,tks}]);
-  setTimeout(()=>window.print(),200);
-  addHist(d,tks); incNum(1);
+  setTimeout(()=>{ window.print(); archivePDFs([{d,tks}]); },200);
 }
-function genAllPDF() {
-  const items = docs.map((d,i)=>({d, tks:getTKS(i)}));
+async function genAllPDF() {
+  let list;
+  try { list = await reserveTKS(docs); } catch(e) { alert(e.message); return; }
+  const items = docs.map((d,i)=>({d, tks:list[i]}));
   buildPrint(items);
-  setTimeout(()=>window.print(),200);
-  items.forEach(({d,tks})=>addHist(d,tks));
-  incNum(docs.length);
+  setTimeout(()=>{ window.print(); archivePDFs(items); },200);
 }
 
+function buildPages(d, tks) {
+  const pages = [buildPg(d,tks)];
+  // Collect all evidence entries (item + photo pairs)
+  const evidList = [];
+  d.items.forEach(item => (item.photos||[]).forEach(photo => evidList.push({item, photo})));
+  // Group in pairs → 2 avarias per page
+  for (let i = 0; i < evidList.length; i += 2) {
+    pages.push(buildEvidPg(d, tks, evidList.slice(i, i + 2)));
+  }
+  return pages;
+}
 function buildPrint(items) {
   const out = document.getElementById('print-out');
   out.innerHTML = '';
-  items.forEach(({d,tks}) => {
-    out.appendChild(buildPg(d,tks));
-    // Collect all evidence entries (item + photo pairs)
-    const evidList = [];
-    d.items.forEach(item => (item.photos||[]).forEach(photo => evidList.push({item, photo})));
-    // Group in pairs → 2 avarias per page
-    for (let i = 0; i < evidList.length; i += 2) {
-      out.appendChild(buildEvidPg(d, tks, evidList.slice(i, i + 2)));
+  items.forEach(({d,tks}) => buildPages(d,tks).forEach(p => out.appendChild(p)));
+}
+
+// Gera o PDF como arquivo (imagem de cada página A4) para arquivar no SharePoint.
+async function buildPdfBlob(d, tks) {
+  const host = document.createElement('div');
+  host.className = 'pdf-render';
+  document.body.appendChild(host);
+  try {
+    const pages = buildPages(d, tks);
+    pages.forEach(p => host.appendChild(p));
+    if (document.fonts) await document.fonts.ready;
+    await Promise.all([...host.querySelectorAll('img')].map(img =>
+      img.complete ? null : new Promise(r => { img.onload = img.onerror = r; })));
+    const pdf = new jspdf.jsPDF({ unit:'mm', format:'a4' });
+    for (let i = 0; i < pages.length; i++) {
+      const canvas = await html2canvas(pages[i], { scale:2, useCORS:true, backgroundColor:'#fff' });
+      if (i) pdf.addPage();
+      pdf.addImage(canvas.toDataURL('image/jpeg', 0.9), 'JPEG', 0, 0, 210,
+                   Math.min(297, 210 * canvas.height / canvas.width));
     }
-  });
+    return pdf.output('blob');
+  } finally { host.remove(); }
+}
+
+// Envia os PDFs para a pasta do SharePoint e grava o link no histórico.
+async function archivePDFs(items) {
+  if (!spOn()) return;
+  const falhas = [];
+  for (let i = 0; i < items.length; i++) {
+    const { d, tks } = items[i];
+    spStatus(`☁️ arquivando PDF ${i+1}/${items.length}…`);
+    try {
+      const blob = await buildPdfBlob(d, tks);
+      const url = await spUploadPdf(blob, `EXTRATO ${tks} - ${d.placa||'SEM PLACA'}.pdf`);
+      await spUpdate(data => { const h = data.historico.find(x => x.tks === tks); if (h) h.pdfUrl = url; });
+    } catch(e) { console.error(e); falhas.push(tks + ' (' + e.message + ')'); }
+  }
+  spStatus('☁️ SharePoint · ' + spUser());
+  if (falhas.length) alert('Não foi possível arquivar no SharePoint:\n' + falhas.join('\n'));
 }
 
 function pgCorner() {
@@ -1227,24 +1303,25 @@ function buildEvidPg(d, tks, group) {
 // ──────────── DOCX GENERATION ────────────
 async function genOneDOCX(ci) {
   if (!docxBuf) { alert('Carregue o arquivo Papel_Timbrado_TKS.docx primeiro (aba Upload).'); return; }
-  const d = docs[ci]; const tks = getTKS(ci);
+  const d = docs[ci];
+  let tks;
+  try { [tks] = await reserveTKS([d]); } catch(e) { alert(e.message); return; }
   const blob = await buildDOCX(d, tks);
   dlBlob(blob, `EXTRATO ${tks} - ${d.placa}.docx`);
-  addHist(d,tks); incNum(1);
 }
 
 async function genAllDOCX() {
   if (!docxBuf) { alert('Carregue o arquivo Papel_Timbrado_TKS.docx primeiro (aba Upload).'); return; }
+  let list;
+  try { list = await reserveTKS(docs); } catch(e) { alert(e.message); return; }
   const zip = new JSZip();
   for (let i=0;i<docs.length;i++) {
-    const d=docs[i]; const tks=getTKS(i);
+    const d=docs[i]; const tks=list[i];
     const blob = await buildDOCX(d,tks);
     zip.file(`EXTRATO ${tks} - ${d.placa}.docx`, blob);
   }
   const zb = await zip.generateAsync({type:'blob'});
   dlBlob(zb,'extratos_tks.zip');
-  docs.forEach((d,i)=>addHist(d,getTKS(i)));
-  incNum(docs.length);
 }
 
 async function buildDOCX(d, tks) {
@@ -1312,25 +1389,155 @@ ${wp(wr(TERMS,{sz:'16'}))}
 }
 
 // ──────────── HISTORY ────────────
-function addHist(d,tks) {
-  hist.unshift({ tks, placa:d.placa, cliente:d.locatario, data:new Date().toLocaleDateString('pt-BR'),
-                 total:d.totalFmt, ts:new Date().toISOString() });
-  trySave('tks_hist', hist);
+function histEntry(d,tks) {
+  return { tks, placa:d.placa, cliente:d.locatario, data:new Date().toLocaleDateString('pt-BR'),
+           total:d.totalFmt, ts:new Date().toISOString(), usuario:spUser() };
 }
 function renderHist() {
   const tb = document.getElementById('hist-body');
   tb.innerHTML = hist.length
-    ? hist.map(h=>`<tr><td><b>${esc(h.tks)}</b></td><td>${esc(h.placa)}</td><td>${esc(h.cliente)}</td><td>${esc(h.data)}</td><td><b>${esc(h.total)}</b></td><td style="color:var(--muted);font-size:11px">${new Date(h.ts).toLocaleString('pt-BR')}</td></tr>`).join('')
-    : '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Nenhum extrato gerado ainda.</td></tr>';
+    ? hist.map(h=>`<tr><td><b>${esc(h.tks)}</b></td><td>${esc(h.placa)}</td><td>${esc(h.cliente)}</td><td>${esc(h.data)}</td><td><b>${esc(h.total)}</b></td><td style="color:var(--muted);font-size:11px">${new Date(h.ts).toLocaleString('pt-BR')}</td><td style="font-size:11px">${esc(h.usuario)}</td><td>${h.pdfUrl?`<a href="${esc(h.pdfUrl)}" target="_blank" rel="noopener">📄 abrir</a>`:''}</td></tr>`).join('')
+    : '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px">Nenhum extrato gerado ainda.</td></tr>';
 }
 function dlHistCSV() {
-  const hdr='Nº TKS\tPlaca\tCliente\tData\tTotal\tGerado em\n';
-  const rows=hist.map(h=>`${h.tks}\t${h.placa}\t${h.cliente}\t${h.data}\t${h.total}\t${new Date(h.ts).toLocaleString('pt-BR')}`).join('\n');
+  const hdr='Nº TKS\tPlaca\tCliente\tData\tTotal\tGerado em\tUsuário\tPDF\n';
+  const rows=hist.map(h=>`${h.tks}\t${h.placa}\t${h.cliente}\t${h.data}\t${h.total}\t${new Date(h.ts).toLocaleString('pt-BR')}\t${h.usuario||''}\t${h.pdfUrl||''}`).join('\n');
   dlBlob(new Blob(['﻿'+hdr+rows],{type:'text/csv;charset=utf-8'}),'historico_extratos.csv');
 }
-function clearHist() {
-  if (!confirm('Limpar todo o histórico?')) return;
-  hist=[]; trySave('tks_hist',[]); renderHist();
+async function clearHist() {
+  if (!spOn()) {
+    if (!confirm('Limpar todo o histórico?')) return;
+    hist=[]; trySave('tks_hist',[]); renderHist(); return;
+  }
+  if (!confirm('O histórico é compartilhado: isso apaga o histórico de TODOS os usuários. Continuar?')) return;
+  try { await spUpdate(data => { data.historico = []; }); }
+  catch(e) { alert('Não foi possível limpar no SharePoint: '+e.message); }
+}
+
+// ──────────── SHAREPOINT (JSON compartilhado via Microsoft Graph) ────────────
+// Preencha com os dados do registro do app no Entra ID (Azure AD) e do site do SharePoint.
+const SP_CONFIG = {
+  tenantId: '8babaf2b-248f-4651-98d6-1e5312fbe00a',
+  clientId: '8e856ffe-6802-4d7f-b2ca-86eee177c89c',
+  // Link da pasta do SharePoint (MaroniDigital) onde tudo é salvo
+  folderLink: 'https://grupotransmaroni.sharepoint.com/:f:/s/MaroniDigital/IgC6HolbyN_aRohpBU6fb9DLATX5aWNXhGRVRwyV1V6-aDU',
+  file:     'tks_dados.json',               // JSON com número e histórico (dentro da pasta)
+  pdfFolder:'PDFs'                          // os PDFs ficam em PDFs/<ano>/
+};
+const SP_SCOPES = ['User.Read', 'Sites.ReadWrite.All'];
+const GRAPH = 'https://graph.microsoft.com/v1.0';
+let msal = null, spAccount = null, spFolder = null, spReady = false;
+
+function spCfgOk() { return !/COLE_AQUI/.test(SP_CONFIG.tenantId+SP_CONFIG.clientId+SP_CONFIG.folderLink); }
+function spOn() { return spReady; }
+function spUser() { return spAccount ? (spAccount.name || spAccount.username) : ''; }
+function spStatus(txt, showLogin=false) {
+  document.getElementById('sync-badge').textContent = txt;
+  document.getElementById('sync-login').style.display = showLogin ? '' : 'none';
+}
+
+async function spInit() {
+  if (!spCfgOk()) { spStatus('modo local (SharePoint não configurado)'); return; }
+  if (!window.msal) { spStatus('erro ao carregar login Microsoft'); return; }
+  msal = new window.msal.PublicClientApplication({
+    auth: { clientId: SP_CONFIG.clientId,
+            authority: `https://login.microsoftonline.com/${SP_CONFIG.tenantId}`,
+            redirectUri: location.origin + location.pathname },
+    cache: { cacheLocation: 'localStorage' }
+  });
+  await msal.initialize();
+  try {
+    const r = await msal.handleRedirectPromise();
+    spAccount = (r && r.account) || msal.getAllAccounts()[0] || null;
+  } catch(e) { console.error(e); }
+  if (!spAccount) { spStatus('não conectado', true); return; }
+  try {
+    spStatus('sincronizando…');
+    await spRefresh();
+    spReady = true;
+    spStatus('☁️ SharePoint · ' + spUser());
+  } catch(e) {
+    console.error(e);
+    spStatus('erro no SharePoint', true);
+    alert('Erro ao acessar o SharePoint: ' + e.message);
+  }
+}
+function spLogin() {
+  if (!spCfgOk()) { alert('Configure SP_CONFIG no código primeiro.'); return; }
+  msal.loginRedirect({ scopes: SP_SCOPES });
+}
+async function spToken() {
+  try {
+    return (await msal.acquireTokenSilent({ scopes: SP_SCOPES, account: spAccount })).accessToken;
+  } catch(e) {
+    await msal.acquireTokenRedirect({ scopes: SP_SCOPES, account: spAccount });
+    throw new Error('Redirecionando para login…');
+  }
+}
+async function gfetch(url, opts={}) {
+  const token = await spToken();
+  const headers = Object.assign({ Authorization: 'Bearer ' + token }, opts.headers || {});
+  return fetch(url.startsWith('http') ? url : GRAPH + url, Object.assign({}, opts, { headers, cache: 'no-store' }));
+}
+function spFileUrl(suffix='', file=SP_CONFIG.file) {
+  const path = file.split('/').map(encodeURIComponent).join('/');
+  return `/drives/${spFolder.driveId}/items/${spFolder.id}:/${path}${suffix}`;
+}
+// Descobre a pasta (drive + item) a partir do link de compartilhamento.
+async function spResolveFolder() {
+  const enc = 'u!' + btoa(SP_CONFIG.folderLink).replace(/=+$/,'').replace(/\//g,'_').replace(/\+/g,'-');
+  const r = await gfetch(`/shares/${enc}/driveItem?$select=id,name,parentReference`);
+  if (!r.ok) throw new Error(`pasta do SharePoint não encontrada ou sem acesso (${r.status})`);
+  const it = await r.json();
+  spFolder = { id: it.id, driveId: it.parentReference.driveId };
+}
+// Sobe o PDF (as pastas são criadas automaticamente) e devolve o link do SharePoint.
+async function spUploadPdf(blob, name) {
+  const safe = name.replace(/[\\/:*?"<>|#%]/g, '-');
+  const file = `${SP_CONFIG.pdfFolder}/${new Date().getFullYear()}/${safe}`;
+  const r = await gfetch(spFileUrl(':/content', file),
+    { method:'PUT', headers:{'Content-Type':'application/pdf'}, body: blob });
+  if (!r.ok) throw new Error(`erro ao enviar PDF (${r.status})`);
+  return (await r.json()).webUrl;
+}
+// Lê o JSON + eTag. Cria o arquivo se ainda não existir.
+async function spRead() {
+  if (!spFolder) await spResolveFolder();
+  const meta = await gfetch(spFileUrl());
+  if (meta.status === 404) {
+    const init = { proximoNumero: parseInt(localStorage.getItem('tks_num'),10) || 604,
+                   historico: tryParse('tks_hist', []) };
+    const c = await gfetch(spFileUrl(':/content?@microsoft.graph.conflictBehavior=fail'),
+      { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(init, null, 2) });
+    if (!c.ok && c.status !== 409) throw new Error(`não foi possível criar o arquivo (${c.status})`);
+    return spRead();
+  }
+  if (!meta.ok) throw new Error(`erro ao ler arquivo (${meta.status})`);
+  const m = await meta.json();
+  const body = await (await fetch(m['@microsoft.graph.downloadUrl'], { cache:'no-store' })).json();
+  body.proximoNumero = parseInt(body.proximoNumero,10) || 604;
+  body.historico = Array.isArray(body.historico) ? body.historico : [];
+  return { data: body, etag: m.eTag };
+}
+function spApply(data) {
+  hist = data.historico;
+  numInp.value = String(data.proximoNumero).padStart(4,'0');
+  updateNumPreview(); renderHist();
+}
+async function spRefresh() { spApply((await spRead()).data); }
+// Leitura → alteração → gravação com If-Match. Se outro usuário gravou no meio, tenta de novo.
+async function spUpdate(mutate) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const { data, etag } = await spRead();
+    mutate(data);
+    const r = await gfetch(spFileUrl(':/content'), {
+      method:'PUT', headers:{ 'Content-Type':'application/json', 'If-Match': etag },
+      body: JSON.stringify(data, null, 2) });
+    if (r.ok) { spApply(data); return data; }
+    if (r.status !== 412 && r.status !== 409) throw new Error(`erro ao gravar (${r.status})`);
+    await new Promise(res => setTimeout(res, 300 + Math.random()*700));
+  }
+  throw new Error('arquivo ocupado por outro usuário, tente novamente');
 }
 
 // ──────────── UTILS ────────────
