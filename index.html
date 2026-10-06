@@ -1,9 +1,10 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TKS – Gerador de Extratos de Avarias</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -923,15 +924,17 @@ function buildCard(d, i) {
     </div>
 
     ${d.pageImages&&d.pageImages.length ? `
-    <div class="sec-lbl" style="margin-top:14px">Fotos extraídas do PDF (${d.pageImages.length} página${d.pageImages.length>1?'s':''})</div>
+    <div class="sec-lbl" style="margin-top:14px">Fotos extraídas do PDF (${d.pageImages.length} foto${d.pageImages.length>1?'s':''}) — o selo mostra o item de cada foto; clique para mudar</div>
     <div style="display:flex;flex-wrap:wrap;gap:8px;padding:8px 0">
-      ${d.pageImages.map((src,pi)=>`
+      ${d.pageImages.map((src,pi)=>{
+        const own = photoOwners(d, src);
+        return `
         <div style="position:relative">
-          <img src="${src}" style="height:90px;width:auto;border-radius:6px;border:2px solid ${pi<d.items.length&&(d.items[pi].photos||[]).includes(src)?'#15803d':'#e0e4ec'};object-fit:cover;cursor:pointer"
-            title="Página ${pi+2} do PDF${pi<d.items.length?' — atribuída ao item '+(pi+1):''}"
+          <img src="${src}" style="height:90px;width:auto;border-radius:6px;border:2px solid ${own.length?'#15803d':'#e0e4ec'};object-fit:cover;cursor:pointer;${own.length?'':'opacity:.55'}"
+            title="${own.length?'Foto do item '+own.join(', '):'Foto sem item (não vai para o extrato)'} — clique para mudar"
             onclick="reassignPhoto(${i},${pi},this.src)">
-          <span style="position:absolute;top:3px;left:4px;background:rgba(0,0,0,.55);color:#fff;font-size:9px;padding:1px 4px;border-radius:3px">p.${pi+2}</span>
-        </div>`).join('')}
+          <span style="position:absolute;top:3px;left:4px;background:${own.length?'#15803d':'rgba(0,0,0,.55)'};color:#fff;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${own.length?'Item '+own.join(', '):'sem item'}</span>
+        </div>`;}).join('')}
     </div>` : ''}
     <div class="act-row">
       <button class="btn btn-nav" onclick="genOnePDF(${i})">🖨️ Imprimir / Salvar PDF</button>
@@ -1013,14 +1016,23 @@ function removePhoto(ci, ri, photoIdx) {
   if (tb) tb.innerHTML = renderRows(docs[ci].items, ci);
 }
 
+// Itens que já usam esta foto (nº do item).
+function photoOwners(d, src) { return d.items.filter(it => (it.photos||[]).includes(src)).map(it => it.num); }
+
+// Move a foto para outro item (0 = tirar de todos os itens).
 function reassignPhoto(ci, pageIdx, src) {
   const d = docs[ci];
   if (!d.items.length) return;
-  const target = prompt(`Atribuir foto da página ${pageIdx+2} a qual item? (1-${d.items.length})`, pageIdx+1);
-  const ri = parseInt(target) - 1;
-  if (isNaN(ri) || ri < 0 || ri >= d.items.length) return;
-  if (!d.items[ri].photos) d.items[ri].photos = [];
-  d.items[ri].photos.push(src);
+  const atual = photoOwners(d, src);
+  const target = prompt(`Foto ${pageIdx+1} — está no item: ${atual.length ? atual.join(', ') : 'nenhum'}.\n`
+    + `Mover para qual item? (${d.items.map(it=>it.num).join(', ')})\nDigite 0 para não usar a foto.`, atual[0] ?? '');
+  if (target === null || target.trim() === '') return;
+  const num = parseInt(target);
+  if (isNaN(num)) return;
+  const dest = d.items.find(it => it.num === num);
+  if (num !== 0 && !dest) { alert('Item ' + num + ' não existe.'); return; }
+  d.items.forEach(it => { if (it.photos) it.photos = it.photos.filter(p => p !== src); });
+  if (dest) (dest.photos = dest.photos || []).push(src);
   renderCards();
 }
 
